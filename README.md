@@ -22,7 +22,7 @@ npx -y @mvanhorn/printing-press-library install delta-trip --cli-only
 
 Verify: `delta-trip-pp-cli --version`
 
-> The CLI opens a visible Chrome window briefly during each check — this is expected. Delta's website blocks headless browsers, so a headed browser is required.
+> Runs silently using headless Chrome — no visible window during checks. If Delta's bot detection ever blocks headless mode, add `HEADED=true` to your `.env` to fall back to a visible window.
 
 **3. Gmail App Password**
 

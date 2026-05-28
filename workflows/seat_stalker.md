@@ -102,7 +102,7 @@ Every run appends to `.tmp/seatstalker.log`:
 | `10` | Config error |
 
 ## Notes
-- The seat map check opens a visible Chrome window briefly (required — delta.com blocks headless browsers)
+- The seat map check runs silently using headless Chrome — no visible window. Set `HEADED=true` in `.env` to fall back to a visible window if Delta's bot detection blocks headless mode.
 - Trip metadata is cached for 4 hours in SQLite; add `--no-cache` to the CLI args in `check_seats.py` to bypass
 - `DELTA_TRIP_CLI` in `.env` sets the full path to the binary if it's not on your system PATH
 - Email is only sent when target seats are found — no email on a miss, no inbox flooding during scheduled runs

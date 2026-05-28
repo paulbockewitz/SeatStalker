@@ -29,6 +29,7 @@ GMAIL_SENDER = os.getenv("GMAIL_SENDER", "")
 GMAIL_RECIPIENT = os.getenv("GMAIL_RECIPIENT", GMAIL_SENDER)
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 CLI = os.getenv("DELTA_TRIP_CLI", "delta-trip-pp-cli")
+HEADED = os.getenv("HEADED", "").lower() in ("1", "true", "yes")
 LOG_FILE = Path(".tmp") / "seatstalker.log"
 
 
@@ -88,7 +89,10 @@ def run_cli(args):
 
 def get_trip_flights(confirmation, first_name, last_name):
     """Fetch all flights for the trip. Returns (flights list, raw trip dict)."""
-    raw = run_cli(["trips", confirmation, first_name, last_name, "--json"])
+    args = ["trips", confirmation, first_name, last_name, "--json"]
+    if HEADED:
+        args.append("--headed")
+    raw = run_cli(args)
     data = json.loads(raw)
     trip = data.get("results", data)
     return trip.get("flights", []), trip
@@ -121,11 +125,10 @@ def resolve_flight_index(flights, flight_input):
 
 def get_seat_map(confirmation, first_name, last_name, flight_index):
     """Fetch the seatmap JSON for the specified leg (returns data directly, no envelope)."""
-    raw = run_cli([
-        "seatmap", confirmation, first_name, last_name,
-        "--flight", str(flight_index),
-        "--agent",
-    ])
+    args = ["seatmap", confirmation, first_name, last_name, "--flight", str(flight_index), "--agent"]
+    if HEADED:
+        args.append("--headed")
+    raw = run_cli(args)
     return json.loads(raw)
 
 
