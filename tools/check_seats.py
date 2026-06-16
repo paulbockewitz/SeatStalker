@@ -1,20 +1,23 @@
 """
-SeatStalker: Check Delta flight seat availability against target seats and send email alert.
+SeatStalker: Check airline flight seat availability against target seats and send email alert.
 
 Usage:
     python tools/check_seats.py --confirmation ABC123 --first-name John --last-name Smith \
         --flight DL5597 --target-seats "12A,14C"
 
-    --flight accepts a Delta flight number (DL5597 or 5597) or a leg index (1, 2, 3).
+    --flight accepts a flight number (DL5597 or 5597) or a leg index (1, 2, 3).
     --target-seats accepts specific seats (12A,14C) or a row range (12-15).
+
+    Airline is auto-detected from the flight number prefix (DL=Delta, IB=Iberia).
+    Override with --airline or the AIRLINE env var.
 """
 
 import argparse
+import importlib
 import json
 import os
 import re
 import smtplib
-import subprocess
 import sys
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
@@ -28,9 +31,34 @@ load_dotenv()
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "")
 GMAIL_RECIPIENT = os.getenv("GMAIL_RECIPIENT", GMAIL_SENDER)
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-CLI = os.getenv("DELTA_TRIP_CLI", "delta-trip-pp-cli")
-HEADED = os.getenv("HEADED", "").lower() in ("1", "true", "yes")
 LOG_FILE = Path(".tmp") / "seatstalker.log"
+
+# Map IATA carrier prefix -> adapter module name in tools/adapters/
+AIRLINE_MAP = {
+    "DL": "delta",
+    "IB": "iberia",
+}
+
+
+def load_adapter(airline_code):
+    """Return an instantiated AirlineAdapter for the given two-letter code."""
+    name = AIRLINE_MAP.get(airline_code.upper())
+    if not name:
+        supported = ", ".join(AIRLINE_MAP.keys())
+        print(f"ERROR: Unknown airline code '{airline_code}'. Supported: {supported}", file=sys.stderr)
+        sys.exit(10)
+    # tools/ is on sys.path (added below main) so adapters is importable directly
+    mod = importlib.import_module(f"adapters.{name}")
+    cls_name = name.capitalize() + "Adapter"
+    return getattr(mod, cls_name)()
+
+
+def detect_airline(flight_str):
+    """Detect the two-letter airline code from a flight string like 'DL5597' or 'IB1234'."""
+    m = re.match(r"^([A-Z]{2})", flight_str.strip().upper())
+    if m:
+        return m.group(1)
+    return None
 
 
 def log(message):
@@ -74,46 +102,25 @@ def seat_matches_targets(seat_number, targets):
     return False
 
 
-def run_cli(args):
-    """Run the delta-trip CLI and return stdout as a string. Exits on error."""
-    result = subprocess.run(
-        [CLI] + args,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"CLI error (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
-        sys.exit(result.returncode)
-    return result.stdout
-
-
-def get_trip_flights(confirmation, first_name, last_name):
-    """Fetch all flights for the trip. Returns (flights list, raw trip dict)."""
-    args = ["trips", confirmation, first_name, last_name, "--json"]
-    if HEADED:
-        args.append("--headed")
-    raw = run_cli(args)
-    data = json.loads(raw)
-    trip = data.get("results", data)
-    return trip.get("flights", []), trip
-
-
 def resolve_flight_index(flights, flight_input):
     """
-    Resolve flight input to a 1-based leg index given the flights list from get_trip_flights.
-    Accepts a Delta flight number (DL5597 / 5597) or a leg index (1, 2, 3).
+    Resolve flight input to a 1-based leg index given the flights list.
+    Accepts a flight number (DL5597 / 5597 / IB1234) or a leg index (1, 2, 3).
     Returns (index, flight_dict).
     """
-    flight_str = str(flight_input).strip().upper().lstrip("DL")
+    flight_str = str(flight_input).strip().upper()
+    # Strip any two-letter carrier prefix for numeric matching
+    numeric = re.sub(r"^[A-Z]{2}", "", flight_str)
 
-    if re.match(r"^\d{1,2}$", flight_str):
+    if re.match(r"^\d{1,2}$", numeric) and not re.match(r"^[A-Z]{2}\d{1,2}$", flight_str):
+        # Pure index like "1" or "2"
         idx = int(flight_str)
         match = next((f for f in flights if f.get("flightIndex", "").startswith(str(idx))), None)
         return idx, match
 
     for flight in flights:
-        fn = re.sub(r"^DL", "", flight.get("flightNumber", "").upper())
-        if fn == flight_str:
+        fn = re.sub(r"^[A-Z]{2}", "", flight.get("flightNumber", "").upper())
+        if fn == numeric:
             idx_str = flight.get("flightIndex", "1")  # "2 of 3"
             return int(idx_str.split()[0]), flight
 
@@ -121,15 +128,6 @@ def resolve_flight_index(flights, flight_input):
     for f in flights:
         print(f"  {f.get('flightNumber')} ({f.get('flightIndex')})", file=sys.stderr)
     sys.exit(3)
-
-
-def get_seat_map(confirmation, first_name, last_name, flight_index):
-    """Fetch the seatmap JSON for the specified leg (returns data directly, no envelope)."""
-    args = ["seatmap", confirmation, first_name, last_name, "--flight", str(flight_index), "--agent"]
-    if HEADED:
-        args.append("--headed")
-    raw = run_cli(args)
-    return json.loads(raw)
 
 
 def find_available_targets(seat_map, targets):
@@ -158,7 +156,6 @@ def build_seat_map_html(seat_map, targets):
       dark gray = occupied
       light gray = blocked
     """
-    # Collect target row numbers so we know which rows to show
     target_rows = set()
     for t in targets:
         if t.startswith("ROW"):
@@ -178,7 +175,6 @@ def build_seat_map_html(seat_map, targets):
 
     sections = []
     for cabin in seat_map.get("cabins", []):
-        # Filter to rows containing at least one target seat
         relevant_rows = [
             row for row in cabin.get("rows", [])
             if any(seat_matches_targets(s["number"], targets) for s in row.get("seats", []))
@@ -187,10 +183,8 @@ def build_seat_map_html(seat_map, targets):
         if not relevant_rows:
             continue
 
-        # Collect seat letters
         all_letters = sorted({s["number"][-1] for row in relevant_rows for s in row.get("seats", [])})
 
-        # Header row
         header_cells = ['<td style="padding:4px 6px;font-weight:bold;color:#6b7280;"></td>']
         for letter in all_letters:
             header_cells.append(
@@ -302,7 +296,7 @@ def build_email(seat_map, hits, flight_info, targets, args, checked_at):
 
     passengers = (flight_info or {}).get("passengers", [])
     seat_assignments = ", ".join(
-        f"{p['name']} - {p['seat']}" for p in passengers if p.get("name") and p.get("seat")
+        f"{p['name']} - {p['seat']}" for p in passengers if p.get("name") and p.get("seat") and p.get("seat") != "--"
     ) or "unknown"
 
     header_fields = [
@@ -347,12 +341,11 @@ def build_email(seat_map, hits, flight_info, targets, args, checked_at):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SeatStalker: check Delta seat availability and email results. "
-                    "All flags fall back to CONFIRMATION, FIRST_NAME, LAST_NAME, FLIGHT, "
-                    "TARGET_SEATS in .env when not provided."
+        description="SeatStalker: check airline seat availability and email results. "
+                    "All flags fall back to env vars in .env when not provided."
     )
     parser.add_argument("--confirmation", default=os.getenv("CONFIRMATION"),
-                        help="Delta confirmation number (or set CONFIRMATION in .env)")
+                        help="Booking confirmation / locator (or set CONFIRMATION in .env)")
     parser.add_argument("--first-name",   default=os.getenv("FIRST_NAME"),
                         help="Passenger first name (or set FIRST_NAME in .env)")
     parser.add_argument("--last-name",    default=os.getenv("LAST_NAME"),
@@ -361,6 +354,8 @@ def main():
                         help="Flight number or leg index (or set FLIGHT in .env)")
     parser.add_argument("--target-seats", default=os.getenv("TARGET_SEATS"),
                         help="Seats to watch, e.g. 20A,20B or 20-23 (or set TARGET_SEATS in .env)")
+    parser.add_argument("--airline",      default=os.getenv("AIRLINE"),
+                        help="Two-letter airline code (auto-detected from flight number if omitted)")
     args = parser.parse_args()
 
     missing = [f for f, v in [("--confirmation", args.confirmation), ("--first-name", args.first_name),
@@ -369,9 +364,23 @@ def main():
     if missing:
         parser.error(f"Missing required inputs (pass as flags or set in .env): {', '.join(missing)}")
 
-    flights, _ = get_trip_flights(args.confirmation, args.first_name, args.last_name)
+    # Resolve airline — explicit flag/env wins; otherwise auto-detect from flight prefix
+    airline_code = args.airline
+    if not airline_code:
+        airline_code = detect_airline(args.flight)
+    if not airline_code:
+        parser.error(
+            f"Cannot determine airline from flight '{args.flight}'. "
+            "Pass --airline DL (or set AIRLINE in .env)."
+        )
+
+    # Ensure tools/ is on the path so adapters/ is importable
+    sys.path.insert(0, str(Path(__file__).parent))
+
+    adapter = load_adapter(airline_code)
+    flights, _ = adapter.get_trip(args.confirmation, args.first_name, args.last_name)
     flight_index, flight_info = resolve_flight_index(flights, args.flight)
-    seat_map = get_seat_map(args.confirmation, args.first_name, args.last_name, flight_index)
+    seat_map = adapter.get_seat_map(args.confirmation, args.first_name, args.last_name, flight_index)
     targets = parse_target_seats(args.target_seats)
     hits = find_available_targets(seat_map, targets)
     checked_at = datetime.now().strftime("%Y-%m-%d %I:%M %p")

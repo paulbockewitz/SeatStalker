@@ -1,10 +1,12 @@
 # SeatStalker
 
-Monitor an airline reservation (Just Delta for now) for seat availability and get an email alert the moment your target seats open up.
+Monitor airline reservations for seat availability and get an email alert the moment your target seats open up.
 
-For example, you and your travel partner book late and aren't sitting by each other.  The moment that sweet section of 2 seats opens up, SeatStalker will notify you and you can scoop them up.
+For example, you and your travel partner book late and aren't sitting next to each other. The moment that sweet pair of seats opens up, SeatStalker will notify you and you can scoop them up.
 
 When target seats become available, SeatStalker sends an HTML email with a color-coded seat map showing the target rows so you can confirm the positions at a glance. When nothing is available, it logs the check and skips the email — no inbox flooding during scheduled runs.
+
+**Supported airlines:** Delta, Iberia _(more to come — each airline is a self-contained adapter)_
 
 ---
 
@@ -12,15 +14,21 @@ When target seats become available, SeatStalker sends an HTML email with a color
 
 **1. Python 3.9+**
 
-**2. delta-trip-pp-cli** (this is in the Printing Press CLI Library)
+**2. Airline CLI(s)**
 
-SeatStalker uses the [delta-trip Printing Press CLI](https://github.com/mvanhorn/printing-press) to fetch live seat map data from Delta. Install it with:
+SeatStalker uses airline-specific CLIs (from the Printing Press CLI Library) to fetch live seat map data. Install the ones you need:
 
+**Delta:**
 ```
 npx -y @mvanhorn/printing-press-library install delta-trip --cli-only
 ```
-
 Verify: `delta-trip-pp-cli --version`
+
+**Iberia:**
+```
+npx -y @mvanhorn/printing-press-library install iberia-trips --cli-only
+```
+Verify: `iberia-trips-pp-cli --version`
 
 > Runs silently using headless Chrome — no visible window during checks. If Delta's bot detection ever blocks headless mode, add `HEADED=true` to your `.env` to fall back to a visible window.
 
@@ -58,17 +66,23 @@ python tools/check_seats.py
 
 | Key | Required | Description | Example |
 |-----|----------|-------------|---------|
-| `DELTA_TRIP_CLI` | No | Full path to the CLI binary if not on PATH | `C:\path\to\delta-trip-pp-cli.exe` |
+| `DELTA_TRIP_CLI` | No | Full path to Delta CLI binary if not on PATH | `C:\path\to\delta-trip-pp-cli.exe` |
+| `IBERIA_TRIP_CLI` | No | Full path to Iberia CLI binary if not on PATH | `C:\path\to\iberia-trips-pp-cli.exe` |
+| `AIRLINE` | No | Two-letter airline code (auto-detected from flight number) | `DL` or `IB` |
 | `GMAIL_SENDER` | Yes | Gmail address used to send alerts | `you@gmail.com` |
 | `GMAIL_RECIPIENT` | No | Address to receive alerts (defaults to `GMAIL_SENDER`) | `you@gmail.com` |
 | `GMAIL_APP_PASSWORD` | Yes | Gmail App Password (16 chars, spaces ok) | `xxxx xxxx xxxx xxxx` |
-| `CONFIRMATION` | Yes | Delta confirmation number | `ABC123` |
-| `FIRST_NAME` | Yes | Passenger first name | `Jane` |
-| `LAST_NAME` | Yes | Passenger last name | `Smith` |
-| `FLIGHT` | Yes | Flight number or leg index | `DL5597` or `2` |
+| `CONFIRMATION` | Yes | Booking confirmation / locator | `ABC123` |
+| `FIRST_NAME` | Yes* | Passenger first name (*required for Delta; ignored by Iberia) | `Jane` |
+| `LAST_NAME` | Yes | Passenger last name / surname | `Smith` |
+| `FLIGHT` | Yes | Flight number or leg index | `DL5597`, `IB1234`, or `2` |
 | `TARGET_SEATS` | Yes | Seats to watch | `20A,20B` or `20-23` |
 
 All inputs can also be passed as flags — run `python tools/check_seats.py --help` for details.
+
+### Airline auto-detection
+
+The airline is auto-detected from the flight number prefix: `DL` → Delta, `IB` → Iberia. Set `AIRLINE` explicitly if your flight number doesn't start with the carrier code.
 
 ### Target seat formats
 
@@ -80,7 +94,7 @@ All inputs can also be passed as flags — run `python tools/check_seats.py --he
 
 ### Flight input
 
-`FLIGHT` accepts a full Delta flight number (`DL5597` or `5597`) or a 1-based leg index (`1`, `2`, `3`). For multi-segment trips, SeatStalker resolves the flight number to the correct leg automatically.
+`FLIGHT` accepts a full flight number (`DL5597`, `IB1234`) or a 1-based leg index (`1`, `2`, `3`). For multi-segment trips, SeatStalker resolves the flight number to the correct leg automatically.
 
 ---
 
@@ -161,12 +175,25 @@ Generates `.tmp/email_preview.html` using your `.env` config and simulates the f
 
 ---
 
+## Adding a new airline
+
+Each airline is a self-contained adapter in `tools/adapters/`. To add support for a new airline:
+
+1. Create `tools/adapters/<code>.py` extending `AirlineAdapter` (see `tools/adapters/base.py`)
+2. Implement `get_trip()` and `get_seat_map()` — both must return normalized SeatStalker schema
+3. Add the two-letter IATA code to `AIRLINE_MAP` in `tools/check_seats.py`
+
+See `tools/adapters/delta.py` (CLI wrapper) and `tools/adapters/iberia.py` (CLI + direct API) for examples.
+
+---
+
 ## How it works
 
 SeatStalker follows the [WAT framework](CLAUDE.md) — Workflows, Agents, Tools:
 
 - **Workflow** (`workflows/seat_stalker.md`) — the SOP defining inputs, outputs, and edge cases
-- **Tool** (`tools/check_seats.py`) — deterministic Python that calls the CLI, compares seats, and sends email
+- **Adapters** (`tools/adapters/`) — one per airline; each fetches and normalizes trip and seat map data
+- **Tool** (`tools/check_seats.py`) — airline-agnostic: loads the right adapter, compares seats, sends email
 - **Agent** — Claude, when used to orchestrate or modify the workflow
 
-The seat map data comes entirely from `delta-trip-pp-cli` — no Delta credentials, no web scraping in Python. The CLI handles the browser session; SeatStalker just processes the JSON output.
+No airline credentials required — booking reference + passenger name only.

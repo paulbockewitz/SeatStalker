@@ -1,21 +1,31 @@
 # SeatStalker Workflow
 
 ## Objective
-Check a Delta Air Lines reservation to see if any targeted seats are currently available on a specific flight, then email the result to paul.bockewitz@gmail.com.
+Check an airline reservation to see if any targeted seats are currently available on a specific flight, then email the result when hits are found.
 
 ## Tool
 `tools/check_seats.py`
 
-Uses `delta-trip-pp-cli seatmap` to fetch the full seat map, compares available seats against the target list, and sends a Gmail alert when hits are found.
+Loads the airline adapter for the configured flight, fetches the seat map, compares available seats against the target list, and sends a Gmail alert when hits are found.
+
+## Supported Airlines
+
+| Airline | Code | Adapter | Data source |
+|---------|------|---------|-------------|
+| Delta Air Lines | `DL` | `tools/adapters/delta.py` | `delta-trip-pp-cli` |
+| Iberia | `IB` | `tools/adapters/iberia.py` | `iberia-trips-pp-cli` + direct API |
+
+Airline is auto-detected from the FLIGHT prefix (e.g. `DL5597` → Delta). Set `AIRLINE=XX` in `.env` to override.
 
 ## Inputs
 
 | Input | Flag | `.env` key | Format | Example |
 |-------|------|------------|--------|---------|
-| Confirmation number | `--confirmation` | `CONFIRMATION` | 6-char code | `ABC123` |
-| First name | `--first-name` | `FIRST_NAME` | string | `John` |
+| Confirmation / locator | `--confirmation` | `CONFIRMATION` | 6-char code | `ABC123` |
+| First name | `--first-name` | `FIRST_NAME` | string (*required for Delta; ignored by Iberia*) | `John` |
 | Last name | `--last-name` | `LAST_NAME` | string | `Smith` |
-| Flight number or leg index | `--flight` | `FLIGHT` | `DLxxxx`, `xxxx`, or `1`/`2`/`3` | `DL5597` or `2` |
+| Airline | `--airline` | `AIRLINE` | 2-letter code | `DL` or `IB` |
+| Flight number or leg index | `--flight` | `FLIGHT` | `DLxxxx`, `IBxxxx`, or `1`/`2`/`3` | `DL5597` or `2` |
 | Target seats | `--target-seats` | `TARGET_SEATS` | comma list or row range | `12A,14C` or `12-15` |
 
 All inputs can be stored in `.env` so the tool runs with no arguments:
@@ -92,17 +102,18 @@ Every run appends to `.tmp/seatstalker.log`:
 - "No target seats available - email skipped." or "Email sent."
 - `----` separator between runs
 
-## Exit Codes (from delta-trip CLI)
+## Exit Codes (from CLI adapters)
 | Code | Meaning |
 |------|---------|
 | `0` | Success |
 | `3` | Confirmation or flight not found |
 | `5` | API / scraping error |
 | `7` | Rate limited — wait and retry |
-| `10` | Config error |
+| `10` | Config error (unknown airline code, missing CLI) |
 
 ## Notes
 - The seat map check runs silently using headless Chrome — no visible window. Set `HEADED=true` in `.env` to fall back to a visible window if Delta's bot detection blocks headless mode.
-- Trip metadata is cached for 4 hours in SQLite; add `--no-cache` to the CLI args in `check_seats.py` to bypass
-- `DELTA_TRIP_CLI` in `.env` sets the full path to the binary if it's not on your system PATH
-- Email is only sent when target seats are found — no email on a miss, no inbox flooding during scheduled runs
+- Delta trip metadata is cached for 4 hours in SQLite; add `--no-cache` to the CLI args in `adapters/delta.py` to bypass.
+- `DELTA_TRIP_CLI` / `IBERIA_TRIP_CLI` in `.env` set the full path to the CLI binaries if they're not on your system PATH.
+- Email is only sent when target seats are found — no email on a miss, no inbox flooding during scheduled runs.
+- To add a new airline: create `tools/adapters/<code>.py` implementing `get_trip` and `get_seat_map`, then register the 2-letter code in `AIRLINE_MAP` in `check_seats.py`.

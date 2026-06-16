@@ -1,1 +1,2 @@
 python-dotenv
+curl_cffi        # Iberia seatmap requests — Chrome TLS impersonation (HTTP/3 compatible)
