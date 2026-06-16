@@ -1,14 +1,12 @@
 import json
 import os
 import pathlib
-import re
 import subprocess
 import sys
 
 from .base import AirlineAdapter
 
 CLI = os.getenv("IBERIA_TRIP_CLI", "iberia-trips-pp-cli")
-BASE_URL = "https://ibisservices.iberia.com"
 
 
 def _run_cli(args):
@@ -19,24 +17,12 @@ def _run_cli(args):
     return result.stdout
 
 
-def _build_flight_id(flight_number, departure_datetime):
-    """
-    Construct the Iberia seatmap flight_id: carrier + 4-digit number + YYYYMMDD.
-    e.g. "IB0333" + "20260815" -> "IB033320260815"
-    """
-    carrier = flight_number[:2].upper()
-    num = re.sub(r"^[A-Z]{2}", "", flight_number.upper()).zfill(4)
-    try:
-        date_str = departure_datetime.split()[0].replace("-", "")  # "2026-08-15" -> "20260815"
-    except Exception:
-        date_str = ""
-    return f"{carrier}{num}{date_str}"
-
 
 def _normalize_flights(iberia_flights, passengers):
     """Map Iberia CLI flight dicts to the SeatStalker common schema."""
     pax = [
-        {"name": f"{p.get('name', '')} {p.get('surname', '')}".strip(), "seat": "--"}
+        {"name": f"{p.get('name', '')} {p.get('surname', '')}".strip(), "seat": "--",
+         "_iberia_id": p.get("id", "")}
         for p in passengers
     ]
     normalized = []
@@ -68,82 +54,125 @@ def _normalize_flights(iberia_flights, passengers):
 
 def _normalize_seatmap(raw):
     """
-    Normalize Iberia's raw CISM seatmap JSON to SeatStalker schema.
+    Normalize Iberia's CISM seatmap JSON to SeatStalker schema.
 
-    Iberia uses an Amadeus CISM seatmap. The response structure varies across
-    API versions. Two known formats are attempted:
-      Format A: data.decks[].seats (dict keyed by row number, then seat letter)
-      Format B: data.decks[].seatRows[].seats[] (array form)
-
-    If neither matches, the raw JSON is saved to .tmp/iberia_seatmap_raw.json.
-    Share that file to improve this normalization.
+    Three response formats are handled in priority order:
+      Format C: raw["cabins"][].map[][] — v4 sea-cism (SPA navigation path, primary)
+      Format A: raw["decks"][].seats — dict keyed by row (Amadeus Shopping Seatmap)
+      Format B: raw["decks"][].seatRows[] — array form (Amadeus CISM)
     """
     data = raw.get("data", raw)
-    decks = data.get("decks", [])
-    cabins = []
     available_count = 0
+    cabins = []
+    aircraft = ""
+    if isinstance(data.get("aircraft"), dict):
+        aircraft = data["aircraft"].get("model", "")
 
-    for deck in decks:
-        cabin_name = deck.get("type", deck.get("deckInfo", {}).get("cabin", "Main Cabin"))
-        rows_dict = {}
-
-        # --- Format A: seats keyed by row number (Amadeus Shopping Seatmap) ---
-        seats_map = deck.get("seats", {})
-        if seats_map and isinstance(seats_map, dict):
-            for row_num_str, row_data in seats_map.items():
-                if not isinstance(row_data, dict):
-                    continue
-                try:
-                    row_num = int(row_num_str)
-                except ValueError:
-                    continue
-                seats = []
-                for _, seat_data in row_data.items():
-                    if not isinstance(seat_data, dict):
+    # Format C: cabins[].map[][] with occupation "FREE"/"OCCUPIED"/"BLOCKED"
+    current_seats = {}  # passenger_id -> seat_number, e.g. {"ADULT_01": "21C"}
+    if data.get("cabins"):
+        for cabin in data["cabins"]:
+            cabin_name = (cabin.get("cabinClass", {}).get("type") or "Main Cabin").title()
+            rows_dict = {}
+            for seat_row in cabin.get("map", []):
+                for seat in seat_row:
+                    if not isinstance(seat, dict) or seat.get("type") != "SEAT":
                         continue
-                    seat_num = seat_data.get("number", "")
-                    available = bool(seat_data.get("available", False))
-                    chars = seat_data.get("characteristicsCodes", [])
-                    if available:
-                        available_count += 1
-                    seats.append({
-                        "number": seat_num,
-                        "status": "available" if available else "occupied",
-                        "type": ("window" if "W" in chars else "aisle" if "A" in chars else "middle"),
-                        "exitRow": "EM" in chars or "EX" in chars,
-                    })
-                if seats:
-                    rows_dict[row_num] = seats
-
-        # --- Format B: seatRows[] array (Amadeus CISM) ---
-        seat_rows = deck.get("seatRows", [])
-        if not rows_dict and seat_rows:
-            for row_obj in seat_rows:
-                row_num = row_obj.get("number", 0)
-                seats = []
-                for seat_data in row_obj.get("seats", []):
-                    if not isinstance(seat_data, dict):
+                    try:
+                        row_num = int(seat.get("row", ""))
+                    except (ValueError, TypeError):
                         continue
-                    seat_num = seat_data.get("number", "")
-                    status_code = seat_data.get("availabilityStatus", "BLOCKED")
-                    available = status_code == "AVAILABLE"
-                    chars = seat_data.get("characteristicsCodes", [])
-                    if available:
+                    col = seat.get("column", "")
+                    features = seat.get("features") or []
+                    occupation = seat.get("occupation", "")
+                    allowed = seat.get("passengersAllowed") or []
+                    seat_num = "%s%s" % (seat["row"], col)
+                    if occupation == "FREE":
+                        status = "available"
                         available_count += 1
-                    seats.append({
+                    elif occupation == "BLOCKED" and len(allowed) == 1:
+                        # Single passenger allowed on a BLOCKED seat = their current assignment
+                        status = "your-seat"
+                        current_seats[allowed[0]] = seat_num
+                    else:
+                        status = "occupied"
+                    rows_dict.setdefault(row_num, []).append({
                         "number": seat_num,
-                        "status": "available" if available else "occupied",
-                        "type": ("window" if "W" in chars else "aisle" if "A" in chars else "middle"),
-                        "exitRow": "EM" in chars or "EX" in chars,
+                        "status": status,
+                        "type": ("window" if "WINDOW" in features
+                                 else "aisle" if "AISLE" in features
+                                 else "middle"),
+                        "exitRow": "EMERGENCY_EXIT" in features,
                     })
-                if seats:
-                    rows_dict[row_num] = seats
+            if rows_dict:
+                cabins.append({
+                    "name": cabin_name,
+                    "rows": [{"row": rn, "seats": rows_dict[rn]} for rn in sorted(rows_dict)],
+                })
 
-        if rows_dict:
-            cabins.append({
-                "name": cabin_name,
-                "rows": [{"row": rn, "seats": rows_dict[rn]} for rn in sorted(rows_dict)],
-            })
+    if not cabins:
+        # Format A & B: decks[] — legacy Amadeus seatmap fallback
+        for deck in data.get("decks", []):
+            cabin_name = deck.get("type", deck.get("deckInfo", {}).get("cabin", "Main Cabin"))
+            rows_dict = {}
+
+            # Format A: seats keyed by row number (dict)
+            seats_map = deck.get("seats", {})
+            if seats_map and isinstance(seats_map, dict):
+                for row_num_str, row_data in seats_map.items():
+                    if not isinstance(row_data, dict):
+                        continue
+                    try:
+                        row_num = int(row_num_str)
+                    except ValueError:
+                        continue
+                    seats = []
+                    for _, seat_data in row_data.items():
+                        if not isinstance(seat_data, dict):
+                            continue
+                        seat_num = seat_data.get("number", "")
+                        available = bool(seat_data.get("available", False))
+                        chars = seat_data.get("characteristicsCodes", [])
+                        if available:
+                            available_count += 1
+                        seats.append({
+                            "number": seat_num,
+                            "status": "available" if available else "occupied",
+                            "type": ("window" if "W" in chars else "aisle" if "A" in chars else "middle"),
+                            "exitRow": "EM" in chars or "EX" in chars,
+                        })
+                    if seats:
+                        rows_dict[row_num] = seats
+
+            # Format B: seatRows[] array
+            seat_rows = deck.get("seatRows", [])
+            if not rows_dict and seat_rows:
+                for row_obj in seat_rows:
+                    row_num = row_obj.get("number", 0)
+                    seats = []
+                    for seat_data in row_obj.get("seats", []):
+                        if not isinstance(seat_data, dict):
+                            continue
+                        seat_num = seat_data.get("number", "")
+                        status_code = seat_data.get("availabilityStatus", "BLOCKED")
+                        available = status_code == "AVAILABLE"
+                        chars = seat_data.get("characteristicsCodes", [])
+                        if available:
+                            available_count += 1
+                        seats.append({
+                            "number": seat_num,
+                            "status": "available" if available else "occupied",
+                            "type": ("window" if "W" in chars else "aisle" if "A" in chars else "middle"),
+                            "exitRow": "EM" in chars or "EX" in chars,
+                        })
+                    if seats:
+                        rows_dict[row_num] = seats
+
+            if rows_dict:
+                cabins.append({
+                    "name": cabin_name,
+                    "rows": [{"row": rn, "seats": rows_dict[rn]} for rn in sorted(rows_dict)],
+                })
 
     if not cabins:
         dump_path = pathlib.Path(".tmp") / "iberia_seatmap_raw.json"
@@ -157,67 +186,34 @@ def _normalize_seatmap(raw):
         )
         cabins = [{"name": "Main Cabin", "rows": []}]
 
-    return {"cabins": cabins, "availableSeats": available_count, "aircraft": ""}
+    return {"cabins": cabins, "availableSeats": available_count, "aircraft": aircraft,
+            "currentSeats": current_seats}
 
 
 class IberiaAdapter(AirlineAdapter):
-    """
-    Adapter for Iberia via iberia-trips-pp-cli.
-
-    get_trip  — calls the CLI (which uses the Python sidecar for Akamai bypass).
-    get_seat_map — makes a direct Chrome-impersonated HTTP/3 request via curl_cffi,
-                   using the orderToken returned by get_trip.
-    """
-
-    def __init__(self):
-        self._raw_flights = []
-        self._order_token = ""
+    """Adapter for Iberia via iberia-trips-pp-cli."""
 
     def get_trip(self, confirmation, first_name, last_name):
-        # Iberia needs locator + surname only (first name is not required)
-        args = ["trip", "get", "--locator", confirmation, "--surname", last_name, "--agent"]
+        # Iberia needs locator + surname only (first name is not required).
+        # Use a 2-hour cache TTL: trip data is stable and Akamai rate-limits
+        # back-to-back sessions, so fetching less often is safer.
+        args = ["trip", "get", "--locator", confirmation, "--surname", last_name,
+                "--agent", "--max-age", "2h"]
         raw = _run_cli(args)
-        trip = json.loads(raw)
-        self._raw_flights = trip.get("flights", [])
-        self._order_token = trip.get("orderToken", "")
-        flights = _normalize_flights(self._raw_flights, trip.get("passengers", []))
+        try:
+            trip = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"iberia: failed to parse trip JSON: {e}\nOutput: {raw[:200]}", file=sys.stderr)
+            sys.exit(1)
+        flights = _normalize_flights(trip.get("flights", []), trip.get("passengers", []))
         return flights, trip
 
     def get_seat_map(self, confirmation, first_name, last_name, flight_index):
+        args = ["trip", "seatmap", "--locator", confirmation, "--surname", last_name,
+                "--flight", str(flight_index), "--agent"]
+        raw = _run_cli(args)
         try:
-            from curl_cffi import requests as cffi_requests
-        except ImportError:
-            print(
-                "ERROR: curl_cffi is required for Iberia seatmap requests.\n"
-                "Install it with: pip install curl_cffi",
-                file=sys.stderr,
-            )
+            return _normalize_seatmap(json.loads(raw))
+        except json.JSONDecodeError as e:
+            print(f"iberia: failed to parse seatmap JSON: {e}\nOutput: {raw[:200]}", file=sys.stderr)
             sys.exit(1)
-
-        if not self._order_token:
-            # Re-fetch if this adapter instance hasn't seen get_trip yet
-            self.get_trip(confirmation, first_name, last_name)
-
-        # Find the raw Iberia flight for this leg index
-        raw_flight = next(
-            (f for f in self._raw_flights
-             if str(f.get("index", "")).startswith(str(flight_index))),
-            (self._raw_flights[flight_index - 1] if len(self._raw_flights) >= flight_index else None),
-        )
-        if not raw_flight:
-            print(f"ERROR: Flight leg {flight_index} not found in Iberia trip data.", file=sys.stderr)
-            sys.exit(3)
-
-        flight_number = raw_flight.get("flightNumber", "")
-        dep_datetime = raw_flight.get("departure", {}).get("dateTime", "")
-        flight_id = _build_flight_id(flight_number, dep_datetime)
-
-        url = f"{BASE_URL}/api/sea-cism/rs/cism/v4/{self._order_token}/flight/{flight_id}/seatmapLayout"
-        try:
-            resp = cffi_requests.get(url, impersonate="chrome", timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            print(f"ERROR: Iberia seatmap request failed: {e}", file=sys.stderr)
-            sys.exit(5)
-
-        return _normalize_seatmap(resp.json())

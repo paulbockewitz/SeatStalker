@@ -381,6 +381,16 @@ def main():
     flights, _ = adapter.get_trip(args.confirmation, args.first_name, args.last_name)
     flight_index, flight_info = resolve_flight_index(flights, args.flight)
     seat_map = adapter.get_seat_map(args.confirmation, args.first_name, args.last_name, flight_index)
+
+    # Some adapters (e.g. Iberia) embed current seat assignments in the seatmap itself.
+    # Backfill the flight info's passenger list so the email shows current seats correctly.
+    current_seats = seat_map.get("currentSeats", {})
+    if current_seats and flight_info:
+        for p in flight_info.get("passengers", []):
+            pax_id = p.get("_iberia_id", "")
+            if pax_id in current_seats:
+                p["seat"] = current_seats[pax_id]
+
     targets = parse_target_seats(args.target_seats)
     hits = find_available_targets(seat_map, targets)
     checked_at = datetime.now().strftime("%Y-%m-%d %I:%M %p")
